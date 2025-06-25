@@ -6,7 +6,7 @@ import numpy as np
 
 import types
 
-def set_up_problem(target_name,D):
+def set_up_problem(target_name,D,device):
     normalize = None
     if target_name == "onemoon":
         D = 2
@@ -15,12 +15,12 @@ def set_up_problem(target_name,D):
         target = OneMoon()
     if target_name == "funnel":
         bounds = ((-5, 5),) * D #((-3,3),) + ((-5, 5),) * (D-1)
-        uniform = torch.distributions.uniform.Uniform(torch.tensor([b[0] for b in list(bounds)], dtype=torch.float), torch.tensor([b[1] for b in list(bounds)], dtype=torch.float))
+        uniform = torch.distributions.uniform.Uniform(torch.tensor([b[0] for b in list(bounds)], dtype=torch.float).to(device), torch.tensor([b[1] for b in list(bounds)], dtype=torch.float).to(device))
         target = Funnel(D,bounds)
     if target_name == "onegaussian":
         bounds = ((-4, 4),) * D #needed for plotting
-        uniform = torch.distributions.uniform.Uniform(torch.tensor([b[0] for b in list(bounds)], dtype=torch.float), torch.tensor([b[1] for b in list(bounds)], dtype=torch.float))
-        target = OneGaussian(D)
+        uniform = torch.distributions.uniform.Uniform(torch.tensor([b[0] for b in list(bounds)], dtype=torch.float).to(device), torch.tensor([b[1] for b in list(bounds)], dtype=torch.float).to(device))
+        target = OneGaussian(D, device=device)
     if target_name == "twogaussians":
         bounds = ((-5, 5),) * D #needed for plotting
         uniform = torch.distributions.uniform.Uniform(torch.tensor([b[0] for b in list(bounds)], dtype=torch.float), torch.tensor([b[1] for b in list(bounds)], dtype=torch.float))
@@ -201,14 +201,15 @@ class TwoGaussians:
 
 class OneGaussian:
     
-    def __init__(self,d):
-        mean = torch.tensor([2.0*(-1)**(i+1) for i in range(d)])
-        covariance = torch.full((d,d),d/15).fill_diagonal_(d/10)
-        self.normaldist = MultivariateNormal(mean,covariance)
+    def __init__(self, d, device='cpu'):
+        mean = torch.tensor([2.0*(-1)**(i+1) for i in range(d)], device=device)
+        covariance = torch.full((d,d), d/15, device=device).fill_diagonal_(d/10)
+        self.normaldist = MultivariateNormal(mean, covariance)
+        self.device = device
 
     def log_prob(self, z):
         log_prob = self.normaldist.log_prob(z)
-        return log_prob
+        return log_prob.to(self.device)
     
     def sample(self, num_samples=10**6):
         samples = self.normaldist.sample((num_samples,))
