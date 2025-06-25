@@ -1,10 +1,10 @@
 device:
   precision_double: true #use float64 precision
-  device: cpu
+  device: cuda
 exp:
   exp_id:
   seed: 123
-  target: twomoons
+  target: onegaussian
   d: 2
   true_s: 1.0 #Exp(s) noise in RUM
   lambda_dist: mixture_uniform_gaussian #dist where rankings / comparisons are sampled
