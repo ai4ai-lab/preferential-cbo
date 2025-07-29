@@ -1,5 +1,5 @@
 device:
-  precision_double: true #use float64 precision
+  precision_double: false #use float64 precision
   device: cpu
 exp:
   exp_id:
@@ -26,7 +26,7 @@ modelparams:
 plot:
   showduringtraining: true #works only when run as notebook
   showdatapoints: true #works only when run as notebook
-  show_iter: 2500
+  show_iter: 250
   grid_size: 400
   nsamples: 1000000 #default: 1000000
   wasserstein_nsamples: 20000 #default: 20000
