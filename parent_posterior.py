@@ -45,19 +45,41 @@ class ParentPosterior:
         self.XTX += x.T @ x  # outer product, (dxd)
         self.XTy += (x.flatten()*y)  # inner product, (dx1)
         self.n += 1 
+        # accumulate sum-of-squares of y
+        if not hasattr(self, "ssq_y"):
+            self.ssq_y = 0.0
+        self.ssq_y += float(y ** 2)
 
     # recompute log-marginal for every parent set
     # 1) select sub-matrix XTX and vector XTy by mask
     # 2) compute posterior covariance and mean
     # 3) compute log marginal likelihood
     def _log_marginal_likelihood(self):
+        """
+        Compute log  p(y | X_S)  for every parent set S under a conjugate
+        Normal-Inverse-Gamma model with known noise variance (sigma_eps^2).
+        Works for p = 0 (empty set) as well.
+        """
         logml = torch.empty(self.M, dtype=torch.float64)
+
+        # Pre-compute sum y^2 so that the p=0 case has the same expression
+        # XTy = sum (x_i y), but when p=0, we need sum y^2; we keep a running scalar
+        # We can get it from diag(XTX) and XTy, but easiest to store it:
+        ssq_y = getattr(self, 'ssq_y', None)
+        if ssq_y is None:
+            # rebuild once, store for future calls
+            self.ssq_y = ssq_y = 0.0
+        ssq_y = self.ssq_y
+
         for idx, s in enumerate(self.S):
             mask = torch.tensor(s, dtype=torch.bool)
             p = int(mask.sum())
+
             if p == 0:  # empty parent set
-                # No parents: marginal likelihood reduces to constant (prob of observing y with only noise)
-                logml[idx] = -self.n*np.log(self.sigma_eps)  # log P(Y) = -n log sigma_eps
+                # Intercept-only model, no covariates
+                # y_i ~ N(0, sigma_eps^2), log p = -n/2 * log(2*pi*sigma_eps^2) - 1/(2*sigma_eps^2) * (sum y_i^2)
+                logml[idx] = (-self.n/2 * np.log(2*np.pi*self.sigma_eps**2)
+                               - ssq_y / (2*self.sigma_eps**2))
             else:
                 XTXs = self.XTX[mask][:,mask]
                 XTy = self.XTy[mask]
