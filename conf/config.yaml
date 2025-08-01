@@ -10,15 +10,15 @@ exp:
   lambda_dist: mixture_uniform_gaussian #dist where rankings / comparisons are sampled
   mixture_success_prob: 0.333 #when lambda_dist = mixture_uniform_gaussian, this is probability of sampling from Gaussian
 data:
-  k: 5 #the cardinaility of each choice set
+  k: 2 #the cardinaility of each choice set
   n: 100 #the total number of comparisons (when k=2) or rankings (when k>2)
 params:
   flow: neuralsplineflow #flow architexture (to use non-flow model multivariate gaussian, set 'gaussianmodel')
-  nflows: 5 #number of flows in the flow model
+  nflows: 10 #number of flows in the flow model
   max_iter: 2000 #changed from 20000
   batch_size: 4
   optimizer: adam #in low D one can consider adam, otherwise adamax
-  lr: 2e-5
+  lr: 1e-3 #learning rate, changed from 2e-5
   weight_decay: 1e-6
 modelparams:
   s: 1.0 #Exp(s) noise in likelihood
