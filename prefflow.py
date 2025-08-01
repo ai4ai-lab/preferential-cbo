@@ -4,13 +4,15 @@ from normflows.core import NormalizingFlow
 from likelihood import exp_rum_likelihood
 
 class PrefFlow(NormalizingFlow):
-    
     """
-    Class for handling training of a preferential normalazing flow
+    PrefFlow is a Normalizing Flow for preference learning.
+    It is designed to handle k-wise preferences, where k can be greater than 2.
+    The flow is parameterized by a set of flows and a base distribution q0.
+    The flow can be used to sample from the preference space and compute log probabilities.
+    It supports both pairwise comparisons and ranking tasks.
     """
 
     def __init__(self,nflow,s,D,ranking,device,precision_double):
-
         # Call the parent class constructor with the name from the parent instance
         super().__init__(nflow.q0,nflow.flows)
         self.s_raw = torch.nn.Parameter(torch.tensor(s).log()).to(device)
@@ -109,7 +111,6 @@ class PrefFlow(NormalizingFlow):
     def logposterior(self, batch, weightprior=1.0):
         
         if not self.ranking:
-            # X = self.createX(batch[0])
             X_raw, Y = batch
             X = self.createX(X_raw)
             logf, logdetJinv = self.f(X)
@@ -132,7 +133,6 @@ class PrefFlow(NormalizingFlow):
             logf = logf.view(k, n)
             winners_logf = torch.empty(n)
             for i in range(n):
-                #Ck = X[:,:,i]
                 winners_logf[i] = logf[0,i]
                 for j in range(k-1):
                     f_x = logf[j,i]
