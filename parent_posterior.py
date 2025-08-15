@@ -169,7 +169,7 @@ class ParentPosterior:
     
     # -------- "peek" (non-mutating) utilities for EEIG --------
     @torch.no_grad()
-    def peek_update_edge_posterior(self, x_new: torch.Tensor, y_new: torch.Tensor) -> torch.Tensor:
+    def peek_update_edge_posterior(self, x_new, y_new):
         """
         Return edge posterior vector AFTER a virtual update with (x_new, y_new),
         without modifying internal state.
@@ -195,7 +195,7 @@ class ParentPosterior:
         return pj
 
     @torch.no_grad()
-    def peek_update_edge_entropy(self, x_new: torch.Tensor, y_new: torch.Tensor) -> torch.Tensor:
+    def peek_update_edge_entropy(self, x_new, y_new):
         """
         Return sum_j H( edge_j | data ∪ {(x_new,y_new)} ), where H is Bernoulli entropy.
         Useful as an "expected posterior entropy" term for EEIG.
