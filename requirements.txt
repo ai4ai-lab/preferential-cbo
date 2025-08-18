@@ -1,10 +1,27 @@
-normflows
-corner
-hydra-core
-numpy
-POT
-pandas
-matplotlib
-scipy
-torch
-tqdm
+# Core scientific stack
+numpy==1.26.4
+scipy==1.13.1
+pandas==2.2.2
+torch==2.3.1
+torchvision==0.18.1
+
+# Plotting / visualization
+matplotlib==3.9.1
+networkx==3.3
+seaborn==0.13.2
+
+# Notebooks
+jupyter==1.0.0
+notebook==7.2.1
+
+# Normalizing flows & deep learning utils
+normflows==1.7
+
+# Causal discovery baselines
+cdt==0.6.0
+pgmpy==0.1.26
+# NOTE: you may also want to try causal-learn if available
+# causallearn==0.1.3.7   # install via: pip install python-causallearn
+
+# Utilities
+tqdm==4.66.4
