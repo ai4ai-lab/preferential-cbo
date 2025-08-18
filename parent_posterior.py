@@ -13,15 +13,18 @@ class ParentPosterior:
     Prior over subsets factorizes: p(S) proportional to prod_j pi^{z_j} (1-pi)^{1-z_j}
 
     Sufficient statistics are accumulated ONLY from executed interventions:
-      XtX = sum x x^T,  Xty = sum x y,  yty = sum y^2,  n = #points
+        XtX = sum x x^T,  Xty = sum x y,  yty = sum y^2,  n = #points
     """
     def __init__(
         self,
-        d: int,
-        a0: float = 1.0,  # Inverse Gamma prior shape
-        b0: float = 1.0,  # Inverse Gamma prior scale
-        tau2: float = 1.0,  # prior scale for beta (ridge)
-        prior_sparsity: float = 0.5,  # Bernoulli(pi) per edge
+        d,
+        a0 = 1.0,  # Inverse Gamma prior shape
+        b0 = 1.0,  # Inverse Gamma prior scale
+        tau2 = 1.0,  # prior scale for beta (ridge)
+        prior_sparsity = 0.2,  # Bernoulli(pi) per edge
+        prior_mode = "bernoulli",  # "bernoulli" or "uniform"
+        a_pi = 1.0,  # prior shape for pi
+        b_pi = 1.0,  # prior scale for pi
         device: torch.device | None = None,
         dtype: torch.dtype = torch.float64,
     ):
@@ -30,12 +33,18 @@ class ParentPosterior:
         self.b0 = float(b0)
         self.tau2 = float(tau2)
         self.pi = float(prior_sparsity)
+        self.prior_mode = prior_mode
+        self.a_pi = float(a_pi)
+        self.b_pi = float(b_pi)
         self.device = device or torch.device("cpu")
         self.dtype = dtype
+
+        # Store sufficient statistics
         self.reset()
 
     # -------- Core state --------
     def reset(self):
+        """ Reset sufficient statistics to zero. """
         self.n = 0
         self.XtX = torch.zeros((self.d, self.d), dtype=self.dtype, device=self.device)
         self.Xty = torch.zeros((self.d, 1), dtype=self.dtype, device=self.device)
@@ -65,6 +74,17 @@ class ParentPosterior:
         self.n += 1
 
     # -------- Posterior update --------
+    def _log_prior_S(self, mask):
+        k = sum(mask)
+        if self.prior_mode == "bernoulli":
+            return k*math.log(self.pi) + (self.d-k)*math.log(1.0 - self.pi)
+        elif self.prior_mode == "betabinom":
+            # proportional part of Beta-Binomial pmf (constants cancel across S)
+            a, b, d = self.a_pi, self.b_pi, self.d
+            return (math.lgamma(k + a) + math.lgamma(d - k + b) - math.lgamma(d + a + b))
+        else:
+            return 0.0
+    
     def _log_marginal_likelihood_from_stats(self, XtX, Xty, yty, n, mask):
         """
         Conjugate log p(y | X_S) for a given mask and provided sufficient stats.
@@ -73,7 +93,7 @@ class ParentPosterior:
         p = len(idx)
 
         # subset prior log p(S)
-        logpS = sum((math.log(self.pi) if z == 1 else math.log(1.0 - self.pi)) for z in mask)
+        logpS = self._log_prior_S(mask)
 
         if n == 0:
             # uniform marginal if no data; log evidence cancels out across subsets, keep only prior on S
@@ -117,6 +137,7 @@ class ParentPosterior:
             - torch.lgamma(torch.tensor(self.a0, dtype=self.dtype)).item()
             - 0.5 * n * math.log(2.0 * math.pi)
         )
+
         return logpS + log_ml
 
     def _posterior_from_stats(self, XtX, Xty, yty, n):
@@ -197,10 +218,79 @@ class ParentPosterior:
     @torch.no_grad()
     def peek_update_edge_entropy(self, x_new, y_new):
         """
-        Return sum_j H( edge_j | data ∪ {(x_new,y_new)} ), where H is Bernoulli entropy.
+        Return sum_j H(edge_j | data & {(x_new,y_new)}), where H is Bernoulli entropy.
         Useful as an "expected posterior entropy" term for EEIG.
         """
         pj = self.peek_update_edge_posterior(x_new, y_new)
         eps = torch.tensor(1e-12, dtype=self.dtype, device=self.device)
         H = -(pj * torch.log(pj + eps) + (1 - pj) * torch.log(1 - pj + eps))
         return H.sum()
+    
+
+# ---- Convenience wrapper on top of ParentPosterior ----
+class LocalParentPosterior(ParentPosterior):
+    """
+    A thin adapter that knows how to slice a full outcome vector into (x_parents, y_target)
+    and provides safe add/peek methods that can skip updates when you intervened on the target.
+    """
+    def __init__(self, parent_idx, target_idx, **kwargs):
+        super().__init__(d=len(parent_idx), **kwargs)
+        self.parent_idx = list(parent_idx)
+        self.target_idx = int(target_idx)
+
+    def slice_xy(self, outcome: torch.Tensor):
+        out = outcome.to(self.device, self.dtype).view(-1)
+        x = out[self.parent_idx].unsqueeze(0)  # (1, d)
+        y = out[self.target_idx].view(1, 1)  # (1, 1)
+        return x, y
+
+    def add_datapoint_full(self, outcome: torch.Tensor, do_idx: int):
+        # Only skip when we intervened on the target itself
+        if do_idx == self.target_idx:
+            return
+        x, y = self.slice_xy(outcome)
+        super().add_datapoint(x, y)  # update XtX/Xty/yty/n
+    
+    def num_datapoints(self) -> int:
+        return int(self.n)
+
+    
+    # --------- Peeking helpers ---------
+    @torch.no_grad()
+    def peek_update_edge_posterior_full(self, outcome: torch.Tensor, intervened_idx: int | None = None):
+        if intervened_idx == self.target_idx:
+            return self.edge_posterior()
+        x, y = self.slice_xy(outcome)
+        return self.peek_update_edge_posterior(x, y)
+
+    @torch.no_grad()
+    def peek_update_edge_entropy_full(self, outcome: torch.Tensor, intervened_idx: int | None = None):
+        if intervened_idx == self.target_idx:
+            pj = self.edge_posterior()
+            eps = torch.tensor(1e-12, dtype=self.dtype, device=self.device)
+            H = -(pj * torch.log(pj + eps) + (1 - pj) * torch.log(1 - pj + eps))
+            return H.sum()
+        x, y = self.slice_xy(outcome)
+        return self.peek_update_edge_entropy(x, y)
+    
+    @torch.no_grad()
+    def peek_update_edge_entropy_batch(self, X_batch: torch.Tensor, y_batch: torch.Tensor) -> torch.Tensor:
+        """
+        Vectorized version:
+        X_batch: (N, d)  each row is one x_new
+        y_batch: (N, 1)  each row is one y_new
+        Returns:
+        H_batch: (N,) tensor where H_batch[i] is sum_j H(edge_j | data & {(x_i,y_i)})
+        """
+        if X_batch.dim() != 2:
+            raise ValueError("X_batch must be (N, d)")
+        if y_batch.dim() != 2 or y_batch.size(1) != 1:
+            raise ValueError("y_batch must be (N, 1)")
+        N = X_batch.size(0)
+
+        H_list = []
+        for i in range(N):
+            H_i = self.peek_update_edge_entropy(X_batch[i:i+1], y_batch[i:i+1])
+            H_list.append(H_i)
+
+        return torch.stack(H_list).view(-1)
