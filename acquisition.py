@@ -47,15 +47,15 @@ def eeig_pairwise(flow, ppost, x_anchor, candidates, s=1.0, *, anchor_xy=None, c
     if anchor_xy is None or cand_xy is None:
         raise ValueError("eeig_pairwise requires anchor_xy=(ax,ay) and cand_xy=[(cx,cy), ...].")
 
-    # 1) Prior edge entropy (once)
+    # 1) Prior edge entropy
     H_prior = binary_entropy(ppost.edge_posterior()).sum()
 
     # 2) Win probs from PrefFlow
-    logf_a, _ = flow.f(x_anchor)           # (1,)
-    logf_c, _ = flow.f(candidates)         # (N,)
+    logf_a, _ = flow.f(x_anchor)  # (1,)
+    logf_c, _ = flow.f(candidates)  # (N,)
     p_win = torch.sigmoid(((logf_a - logf_c) / s).flatten())  # (N,)
 
-    # 3) Anchor branch (compute once)
+    # 3) Anchor branch
     ax, ay = anchor_xy  # shapes (1, d_x), (1, 1)
     H_anchor = ppost.peek_update_edge_entropy(ax, ay)  # scalar tensor
 
@@ -63,7 +63,7 @@ def eeig_pairwise(flow, ppost, x_anchor, candidates, s=1.0, *, anchor_xy=None, c
     # Can switch peek_update_edge_entropy to batch version if needed
     ig_vals = []
     for (cx, cy), pw in zip(cand_xy, p_win):
-        H_cand = ppost.peek_update_edge_entropy(cx, cy)  # scalar
+        H_cand = ppost.peek_update_edge_entropy(cx, cy)
         H_post = pw * H_anchor + (1.0 - pw) * H_cand
         ig = torch.clamp(H_prior - H_post, min=0.0)
         ig_vals.append((ig / (H_prior + 1e-12)).item())

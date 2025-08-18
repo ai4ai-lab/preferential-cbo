@@ -60,7 +60,7 @@ def real_nvp(K, D, q0, device, precision_double, hidden_multiplier=2):
 
 def residual_flow(K, D, q0, device, precision_double, hidden_units=50, hidden_layers=3):
     """
-    Build a Residual Flow (Neural ODE–style blocks with Lipschitz MLP) + ActNorm.
+    Build a Residual Flow (Neural ODE-style blocks with Lipschitz MLP) + ActNorm.
 
     Args:
     - K (int): Number of flow blocks.

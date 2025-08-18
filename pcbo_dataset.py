@@ -50,13 +50,13 @@ class PCBO_Dataset_Three(Dataset):
         Compute outcome of intervention do(X_i = value)
         Returns the full state after intervention
         """
-        # defaults as tensors
+        # Defaults as tensors
         x1 = self._randn_scalar(0.5)
         x2 = self._randn_scalar(0.5)
         y  = torch.tensor(0.0)
 
         if node_idx == 0:      # X1
-            x1 = torch.as_tensor(value)  # value can be float or tensor; this makes it tensor
+            x1 = torch.as_tensor(value)  # Value can be float or tensor; this makes it tensor
         elif node_idx == 1:    # X2
             x2 = torch.as_tensor(value)
         elif node_idx == 2:    # Y (hard intervention)
@@ -81,10 +81,10 @@ class PCBO_Dataset_Three(Dataset):
     # -------- Data generation --------
     def _sample_intervention(self):
         node = int(torch.randint(0, self.n_nodes, (1,), generator=self.rng))
-        val  = self._uniform_scalar(*self.domain).item()  # store as float
+        val  = self._uniform_scalar(*self.domain).item()  # Store as float
         return node, val
 
-    def _generate_pairwise_data(self, n_queries: int):
+    def _generate_pairwise_data(self, n_queries):
         qs = []
         for _ in range(n_queries):
             intervs, outs, utils = [], [], []
@@ -97,15 +97,15 @@ class PCBO_Dataset_Three(Dataset):
                 outs.append(out)
                 utils.append(util)
 
-            outs = torch.stack(outs)                # (2, 3)
+            outs = torch.stack(outs)  # (2, 3)
             utils = torch.stack(utils).squeeze(-1)  # (2,)
             winner_idx = int(torch.argmax(utils))
 
             qs.append(
                 {
                     "interventions": intervs,  # list[ (node, value), (node, value) ]
-                    "outcomes": outs,          # (2, 3) [X1, X2, Y]
-                    "utilities": utils,        # (2,)
+                    "outcomes": outs,  # (2, 3) [X1, X2, Y]
+                    "utilities": utils,  # (2,)
                     "winner_idx": winner_idx,  # 0 or 1
                 }
             )
@@ -153,7 +153,7 @@ class PCBO_Dataset_Six(Dataset):
 
         self.node_names = ["X1", "X2", "X3", "X4", "X5", "Y"]
 
-        # adjacency (parents -> child), 6x6 matrix
+        # Adjacency (parents -> child), 6x6 matrix
         A = torch.zeros(6, 6, dtype=torch.int64)
         # X4 <- X1, X3
         A[0, 3] = 1
@@ -186,23 +186,23 @@ class PCBO_Dataset_Six(Dataset):
             + eps
         )
         return x4_val, y
-    
-    def _compute_intervention_outcome(self, node_idx: int, value: float) -> torch.Tensor:
+
+    def _compute_intervention_outcome(self, node_idx, value):
         """
         do(X_node_idx = value). Other non-intervened features are sampled.
         Returns state: [X1, X2, X3, X4, X5, Y].
         """
-        # exogenous draws as 0-D tensors (reproducible)
+        # Exogenous draws as 0-D tensors (reproducible)
         x1 = self._randn_scalar(1.0)
         x2 = self._randn_scalar(1.0)
         x3 = self._randn_scalar(1.0)
-        x4 = torch.tensor(0.0)  # set by SCM unless directly intervened
+        x4 = torch.tensor(0.0)  # Set by SCM unless directly intervened
         x5 = self._randn_scalar(1.0)
         y  = torch.tensor(0.0)
 
         v = torch.as_tensor(value)
 
-        # apply intervention
+        # Apply intervention
         if node_idx == 0: x1 = v
         elif node_idx == 1: x2 = v
         elif node_idx == 2: x3 = v
@@ -210,7 +210,7 @@ class PCBO_Dataset_Six(Dataset):
         elif node_idx == 4: x5 = v
         elif node_idx == 5 and self.allow_intervene_on_y: y = v
 
-        # roll forward
+        # Roll forward
         if node_idx == 3 and self.allow_intervene_on_mediator:
             # x4 fixed by intervention; compute y with this x4
             eps = self._randn_scalar(self.noise_std)
@@ -223,7 +223,7 @@ class PCBO_Dataset_Six(Dataset):
                 + eps
             )
         elif not (node_idx == 5 and self.allow_intervene_on_y):
-            # usual structural propagation
+            # Usual structural propagation
             x4, y = self._scm_forward(x1, x2, x3, x4)
 
         return torch.stack([x1, x2, x3, x4, x5, y])
@@ -237,7 +237,7 @@ class PCBO_Dataset_Six(Dataset):
     
     # -------- Data generation --------
     def _allowed_nodes(self):
-        # start with X1,X2,X3,X5 (0,1,2,4)
+        # Start with X1,X2,X3,X5 (0,1,2,4)
         nodes = [0, 1, 2, 4]
         if self.allow_intervene_on_mediator:
             nodes.append(3)
@@ -249,15 +249,15 @@ class PCBO_Dataset_Six(Dataset):
         allowed = self._allowed_nodes()
         idx = int(torch.randint(0, len(allowed), (1,), generator=self.rng))
         node = allowed[idx]
-        val = self._uniform_scalar(*self.domain).item()  # store as float for logs/printing
+        val = self._uniform_scalar(*self.domain).item()  # Store as float for logs/printing
         return node, val
 
-    def _generate_pairwise_data(self, n_queries: int):
+    def _generate_pairwise_data(self, n_queries):
         qs = []
         for _ in range(n_queries):
             intervs, outs, utils = [], [], []
 
-            for _ in range(2):  # pairwise
+            for _ in range(2):  # Pairwise
                 node, val = self._sample_intervention()
                 out = self._compute_intervention_outcome(node, val)
                 util = self._true_utility(out, node)
@@ -265,15 +265,15 @@ class PCBO_Dataset_Six(Dataset):
                 outs.append(out)
                 utils.append(util)
 
-            outs = torch.stack(outs)                # (2, 6)
+            outs = torch.stack(outs)  # (2, 6)
             utils = torch.stack(utils).squeeze(-1)  # (2,)
             winner_idx = int(torch.argmax(utils))
 
             qs.append(
                 {
                     "interventions": intervs,  # list[ (node, value), (node, value) ]
-                    "outcomes": outs,          # (2, 6)
-                    "utilities": utils,        # (2,)
+                    "outcomes": outs,  # (2, 6)
+                    "utilities": utils,  # (2,)
                     "winner_idx": winner_idx,  # 0 or 1
                 }
             )

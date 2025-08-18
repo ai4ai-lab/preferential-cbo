@@ -50,7 +50,7 @@ class ParentPosterior:
         self.Xty = torch.zeros((self.d, 1), dtype=self.dtype, device=self.device)
         self.yty = torch.tensor(0.0, dtype=self.dtype, device=self.device)
 
-        # enumerate all subsets as binary masks
+        # Enumerate all subsets as binary masks
         self.masks: List[Tuple[int, ...]] = [tuple(int(b) for b in np.binary_repr(m, width=self.d))
                                              for m in range(2 ** self.d)]
         self.log_post = torch.full((2 ** self.d,), -float("inf"), dtype=self.dtype, device=self.device)
@@ -79,7 +79,7 @@ class ParentPosterior:
         if self.prior_mode == "bernoulli":
             return k*math.log(self.pi) + (self.d-k)*math.log(1.0 - self.pi)
         elif self.prior_mode == "betabinom":
-            # proportional part of Beta-Binomial pmf (constants cancel across S)
+            # Proportional part of Beta-Binomial pmf (constants cancel across S)
             a, b, d = self.a_pi, self.b_pi, self.d
             return (math.lgamma(k + a) + math.lgamma(d - k + b) - math.lgamma(d + a + b))
         else:
@@ -92,24 +92,24 @@ class ParentPosterior:
         idx = [i for i, z in enumerate(mask) if z == 1]
         p = len(idx)
 
-        # subset prior log p(S)
+        # Subset prior log p(S)
         logpS = self._log_prior_S(mask)
 
         if n == 0:
-            # uniform marginal if no data; log evidence cancels out across subsets, keep only prior on S
+            # Uniform marginal if no data; log evidence cancels out across subsets, keep only prior on S
             return logpS
 
         if p == 0:
-            # No parents: y ~ N(0, σ^2); marginal integrates out β trivially
+            # No parents: y ~ N(0, sigma^2); marginal integrates out beta trivially
             a_n = self.a0 + 0.5 * n
             b_n = self.b0 + 0.5 * yty.item()
             log_det_ratio = 0.0
             quad_term = 0.0
         else:
-            XtX_S = XtX[idx][:, idx]   # (p,p)
-            Xty_S = Xty[idx, :]        # (p,1)
+            XtX_S = XtX[idx][:, idx]  # (p,p)
+            Xty_S = Xty[idx, :]  # (p,1)
 
-            # β | σ^2 ~ N(0, σ^2 τ^2 I) -> V0 = τ^2 I
+            # beta | sigma^2 ~ N(0, sigma^2 tau^2 I) -> V0 = tau^2 I
             V0_inv = (1.0 / self.tau2) * torch.eye(p, dtype=self.dtype, device=self.device)
             Vn_inv = V0_inv + XtX_S
 
@@ -161,10 +161,10 @@ class ParentPosterior:
         Update self.post/self.log_post from current sufficient stats.
         """
         self.post = self._posterior_from_stats(self.XtX, self.Xty, self.yty, self.n)
-        # keep a log copy for diagnostics
+        # Keep a log copy for diagnostics
         with torch.no_grad():
             m = torch.max(torch.log(self.post + 1e-40))
-            self.log_post = torch.log(self.post + 1e-40) - m + m  # numerically safe
+            self.log_post = torch.log(self.post + 1e-40) - m + m  # Numerically safe
 
     # -------- Queries --------
     def edge_posterior(self):
@@ -192,8 +192,7 @@ class ParentPosterior:
     @torch.no_grad()
     def peek_update_edge_posterior(self, x_new, y_new):
         """
-        Return edge posterior vector AFTER a virtual update with (x_new, y_new),
-        without modifying internal state.
+        Return edge posterior vector AFTER a virtual update with (x_new, y_new), without modifying internal state.
         """
         x = x_new.to(self.device, self.dtype)
         if x.dim() == 1:
@@ -207,7 +206,7 @@ class ParentPosterior:
 
         post_new = self._posterior_from_stats(XtX_new, Xty_new, yty_new, n_new)
 
-        # marginalize to edge probabilities
+        # Marginalize to edge probabilities
         pj = torch.zeros(self.d, dtype=self.dtype, device=self.device)
         for mask, pS in zip(self.masks, post_new):
             for j, z in enumerate(mask):
@@ -230,21 +229,21 @@ class ParentPosterior:
 # ---- Convenience wrapper on top of ParentPosterior ----
 class LocalParentPosterior(ParentPosterior):
     """
-    A thin adapter that knows how to slice a full outcome vector into (x_parents, y_target)
-    and provides safe add/peek methods that can skip updates when you intervened on the target.
+    Thin adapter that knows how to slice a full outcome vector into (x_parents, y_target)
+    and provides safe add/peek methods that can skip updates when intervening on the target.
     """
     def __init__(self, parent_idx, target_idx, **kwargs):
         super().__init__(d=len(parent_idx), **kwargs)
         self.parent_idx = list(parent_idx)
         self.target_idx = int(target_idx)
 
-    def slice_xy(self, outcome: torch.Tensor):
+    def slice_xy(self, outcome):
         out = outcome.to(self.device, self.dtype).view(-1)
         x = out[self.parent_idx].unsqueeze(0)  # (1, d)
         y = out[self.target_idx].view(1, 1)  # (1, 1)
         return x, y
 
-    def add_datapoint_full(self, outcome: torch.Tensor, do_idx: int):
+    def add_datapoint_full(self, outcome, do_idx):
         # Only skip when we intervened on the target itself
         if do_idx == self.target_idx:
             return
@@ -257,14 +256,14 @@ class LocalParentPosterior(ParentPosterior):
     
     # --------- Peeking helpers ---------
     @torch.no_grad()
-    def peek_update_edge_posterior_full(self, outcome: torch.Tensor, intervened_idx: int | None = None):
+    def peek_update_edge_posterior_full(self, outcome, intervened_idx=None):
         if intervened_idx == self.target_idx:
             return self.edge_posterior()
         x, y = self.slice_xy(outcome)
         return self.peek_update_edge_posterior(x, y)
 
     @torch.no_grad()
-    def peek_update_edge_entropy_full(self, outcome: torch.Tensor, intervened_idx: int | None = None):
+    def peek_update_edge_entropy_full(self, outcome, intervened_idx=None):
         if intervened_idx == self.target_idx:
             pj = self.edge_posterior()
             eps = torch.tensor(1e-12, dtype=self.dtype, device=self.device)
@@ -274,7 +273,7 @@ class LocalParentPosterior(ParentPosterior):
         return self.peek_update_edge_entropy(x, y)
     
     @torch.no_grad()
-    def peek_update_edge_entropy_batch(self, X_batch: torch.Tensor, y_batch: torch.Tensor) -> torch.Tensor:
+    def peek_update_edge_entropy_batch(self, X_batch, y_batch):
         """
         Vectorized version:
         X_batch: (N, d)  each row is one x_new

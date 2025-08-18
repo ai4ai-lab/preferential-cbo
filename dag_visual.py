@@ -7,9 +7,9 @@ def _coerce_edge_weights(adj: np.ndarray, edge_probs):
     """
     Turn various edge_probs inputs into a dict {(i,j): weight}.
     Accepted forms:
-      - None        -> all existing edges weight=1.0
-      - 2D array    -> same shape as adj, use edge_probs[i,j] where adj[i,j]>0
-      - 1D array    -> length n-1, interpreted as parents -> last node (useful for 3-node toy)
+      - None -> all existing edges weight=1.0
+      - 2D array -> same shape as adj, use edge_probs[i,j] where adj[i,j]>0
+      - 1D array -> length n-1, interpreted as parents -> last node (useful for 3-node toy)
     """
     n = adj.shape[0]
     weights = {}
@@ -33,13 +33,13 @@ def _coerce_edge_weights(adj: np.ndarray, edge_probs):
         return weights
 
     if edge_probs.ndim == 1:
-        # convenience: treat as probabilities of edges into the last node
+        # Convenience: treat as probabilities of edges into the last node
         assert len(edge_probs) == n - 1, "1D edge_probs must have length n-1 (parents -> last node)"
         last = n - 1
         for i in range(n - 1):
             if adj[i, last] > 0:
                 weights[(i, last)] = float(edge_probs[i])
-        # any other edges get weight=1
+        # Any other edges get weight=1
         for i in range(n):
             for j in range(n):
                 if adj[i, j] > 0 and (i, j) not in weights:
