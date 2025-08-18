@@ -3,7 +3,7 @@ import numpy as np
 
 
 @torch.no_grad()
-def binary_entropy(p, eps=1e-9):
+def binary_entropy(p, eps=1e-12):
     """Elementwise Bernoulli entropy H(p) = -p log p - (1-p) log(1-p)"""
     p = torch.clamp(p, 0.0 + eps, 1.0 - eps)
     return -(p * torch.log(p) + (1.0 - p) * torch.log(1.0 - p))
@@ -38,57 +38,34 @@ def pig_pairwise(flow, x, candidates, s):
 
 
 @torch.no_grad()
-def eeig_pairwise(flow, ppost, x_anchor, candidates, s=1.0, anchor_xy=None, cand_xy=None):
+def eeig_pairwise(flow, ppost, x_anchor, candidates, s=1.0, *, anchor_xy=None, cand_xy=None):
     """
-    Edge-Entropy Information Gain (EEIG) for pairwise comparisons.
-
-    If (anchor_xy, cand_xy) are provided, we compute outcome-aware EEIG by
-    peeking the causal posterior with the true (x,y) of each hypothetical outcome.
-    Otherwise, we fall back to the feature-only approximation with y=0.
-
-    Returns:
-        np.ndarray shape (N,) with expected reduction in sum of edge entropies.
+    Outcome-aware EEIG for pairwise comparisons.
+    Requires (anchor_xy, cand_xy) providing true (x,y) for anchor and each candidate.
+    Returns np.ndarray of shape (N,).
     """
-    # 1) Prior edge entropy
+    if anchor_xy is None or cand_xy is None:
+        raise ValueError("eeig_pairwise requires anchor_xy=(ax,ay) and cand_xy=[(cx,cy), ...].")
+
+    # 1) Prior edge entropy (once)
     H_prior = binary_entropy(ppost.edge_posterior()).sum()
 
-    # 2) Preference win probs from PrefFlow
-    logf_anchor, _ = flow.f(x_anchor)  # (1,)
-    logf_cand, _ = flow.f(candidates)  # (N,)
-    p_win = torch.sigmoid(((logf_anchor - logf_cand) / s).flatten())  # (N,)
+    # 2) Win probs from PrefFlow
+    logf_a, _ = flow.f(x_anchor)           # (1,)
+    logf_c, _ = flow.f(candidates)         # (N,)
+    p_win = torch.sigmoid(((logf_a - logf_c) / s).flatten())  # (N,)
 
-    # 3) Decide which (x,y) to use for the virtual updates
-    use_true_outcomes = (anchor_xy is not None) and (cand_xy is not None)
+    # 3) Anchor branch (compute once)
+    ax, ay = anchor_xy  # shapes (1, d_x), (1, 1)
+    H_anchor = ppost.peek_update_edge_entropy(ax, ay)  # scalar tensor
 
-    # Prepare anchor/candidate (x,y)
-    if use_true_outcomes:
-        ax, ay = anchor_xy
-        ax = ax if ax.dim() == 2 else ax.unsqueeze(0)   # (1, d)
-        ay = ay.reshape(1, 1) if torch.is_tensor(ay) else torch.tensor([[float(ay)]], dtype=ppost.dtype, device=ppost.device)
-    else:
-        ax = x_anchor
-        ay = torch.zeros((1, 1), dtype=ppost.dtype, device=ppost.device)  # dummy y
-
+    # 4) Candidate branches (loop)
+    # Can switch peek_update_edge_entropy to batch version if needed
     ig_vals = []
-
-    for i in range(candidates.shape[0]):
-        if use_true_outcomes:
-            cx, cy = cand_xy[i]
-            cx = cx if cx.dim() == 2 else cx.unsqueeze(0)
-            cy = cy.reshape(1, 1) if torch.is_tensor(cy) else torch.tensor([[float(cy)]], dtype=ppost.dtype, device=ppost.device)
-        else:
-            cx = candidates[i:i+1]
-            cy = torch.zeros((1, 1), dtype=ppost.dtype, device=ppost.device)
-
-        # 4) Peek posterior edge entropies for each outcome branch:
-        # - anchor wins -> add (ax, ay)
-        # - candidate wins -> add (cx, cy)
-        H_anchor = ppost.peek_update_edge_entropy(ax, ay)
-        H_cand = ppost.peek_update_edge_entropy(cx, cy)
-
-        # 5) Expected posterior entropy under PrefFlow's outcome probabilities
-        H_post = p_win[i] * H_anchor + (1.0 - p_win[i]) * H_cand
-
-        ig_vals.append((H_prior - H_post).item())
+    for (cx, cy), pw in zip(cand_xy, p_win):
+        H_cand = ppost.peek_update_edge_entropy(cx, cy)  # scalar
+        H_post = pw * H_anchor + (1.0 - pw) * H_cand
+        ig = torch.clamp(H_prior - H_post, min=0.0)
+        ig_vals.append((ig / (H_prior + 1e-12)).item())
 
     return np.array(ig_vals)
