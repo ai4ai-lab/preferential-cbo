@@ -42,7 +42,10 @@ def eeig_pairwise(flow, ppost, x_anchor, candidates, s=1.0, *,
                   anchor_xy=None, cand_xy=None, anchor_intervention=None, 
                   candidate_interventions=None):
     """
-    Enhanced EEIG that accounts for intervention blocking.
+    Outcome-aware EEIG for pairwise comparisons.
+    Requires (anchor_xy, cand_xy) providing true (x,y) for anchor and each candidate.
+    Accounts for intervention blocking.
+    Returns np.ndarray of shape (N,).
     """
     if anchor_xy is None or cand_xy is None:
         raise ValueError("eeig_pairwise requires anchor_xy and cand_xy")
