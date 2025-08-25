@@ -1,7 +1,7 @@
-import math
-from typing import Tuple, List
-import numpy as np
 import torch
+import numpy as np
+from typing import Tuple, List
+import math
 
 
 class ParentPosterior:
@@ -293,3 +293,149 @@ class LocalParentPosterior(ParentPosterior):
             H_list.append(H_i)
 
         return torch.stack(H_list).view(-1)
+    
+
+# -------- Global helpers: build a DAG under acyclicity --------
+@torch.no_grad()
+def edge_matrix_from_locals(local_pp_list, d: int, device=None, dtype=torch.float64):
+    """
+    Build a (d x d) matrix P where P[j, i] ~ P(edge j -> i | data) from a list of LocalParentPosterior,
+    one per target i. The LocalParentPosterior.d is the number of candidate parents for that i and
+    its parent_idx gives which global nodes those are.
+
+    Args:
+        local_pp_list: list[LocalParentPosterior] of length = #targets you maintain
+        d            : total number of variables in the system
+    Returns:
+        P: (d, d) tensor with P[j, i] = posterior prob of j -> i, zeros on diagonal
+    """
+    device = device or (local_pp_list[0].device if local_pp_list else torch.device("cpu"))
+    dtype = dtype or (local_pp_list[0].dtype if local_pp_list else torch.float64)
+    P = torch.zeros((d, d), dtype=dtype, device=device)
+
+    for lpp in local_pp_list:
+        # local edge posterior is length = len(parent_idx)
+        pj_local = lpp.edge_posterior()  # probs for each local parent slot
+        for slot, j_global in enumerate(lpp.parent_idx):
+            P[j_global, lpp.target_idx] = pj_local[slot]
+    # remove self-loops
+    P.fill_diagonal_(0.0)
+    return P
+
+
+@torch.no_grad()
+def _would_create_cycle(reach: torch.Tensor, u: int, v: int) -> bool:
+    """
+    reach[a, b] = True if a can reach b in the current graph.
+    Adding u -> v would create a cycle iff reach[v, u] is already True (there's a path v -> ... -> u).
+    """
+    return bool(reach[v, u].item())
+
+
+@torch.no_grad()
+def greedy_map_dag_from_edge_matrix(
+    P: torch.Tensor,
+    score: str = "logit",  # "logit" or "prob"
+    indegree_cap: int | None = None,
+    forbid_self_loops: bool = True,
+):
+    """
+    Project an edge score matrix P[j, i] to a DAG that maximizes the sum of selected edge scores,
+    subject to acyclicity and optional per-node in-degree caps.
+
+    Args:
+        P            : (d, d) edge scores, e.g., posterior probabilities
+        score        : "logit" (log-odds) or "prob" (raw probability) to rank edges
+        indegree_cap : if not None, each node i can have at most this many incoming edges
+        forbid_self_loops: ignore diagonal entries
+
+    Returns:
+        A: (d, d) binary adjacency matrix of a DAG (A[j, i] = 1 means j -> i)
+    """
+    d = P.size(0)
+    device, dtype = P.device, P.dtype
+
+    # Build candidate list
+    edges = []
+    for j in range(d):
+        for i in range(d):
+            if forbid_self_loops and i == j:
+                continue
+            p = float(P[j, i].item())
+            if p <= 0.0:
+                continue
+            if score == "logit":
+                # stable logit: clamp p away from {0,1}
+                p_eps = min(max(p, 1e-12), 1 - 1e-12)
+                w = math.log(p_eps) - math.log(1.0 - p_eps)
+            elif score == "prob":
+                w = p
+            else:
+                raise ValueError("score must be 'logit' or 'prob'")
+            edges.append((w, j, i))
+
+    # Sort by descending score
+    edges.sort(key=lambda t: t[0], reverse=True)
+
+    # Init graph and reachability
+    A = torch.zeros((d, d), dtype=dtype, device=device)
+    reach = torch.eye(d, dtype=torch.bool, device=device)  # reflexive reachability
+
+    indeg = torch.zeros((d,), dtype=torch.int64, device=device)
+
+    for w, u, v in edges:
+        if indegree_cap is not None and int(indeg[v].item()) >= indegree_cap:
+            continue
+        if _would_create_cycle(reach, u, v):
+            continue
+
+        # Accept edge u -> v
+        A[u, v] = 1.0
+        indeg[v] += 1
+
+        # Update reachability (transitive closure incremental update)
+        # After adding u->v: any node x that reaches u can now reach all nodes that v reaches.
+        # Update: reach[:, v] |= reach[:, u]; then for all z: if reach[v, z] True, reach[:, z] |= reach[:, u]
+        # Implement this with vector ops:
+        new_reach_to_v = reach[:, u]  # who reaches u
+        # For all columns z with reach[v, z] == True, set reach[:, z] |= new_reach_to_v
+        cols_to_update = reach[v, :].nonzero(as_tuple=False).view(-1)
+        if cols_to_update.numel() > 0:
+            reach[:, cols_to_update] = reach[:, cols_to_update] | new_reach_to_v.unsqueeze(1)
+        # Also, v itself becomes reachable from those:
+        reach[:, v] = reach[:, v] | new_reach_to_v
+
+    return A
+
+
+def notears_acyclicity(A: torch.Tensor) -> torch.Tensor:
+    """
+    Smooth acyclicity measure from NOTEARS:
+      h(A) = trace(expm(A ∘ A)) - d
+    h(A) == 0 iff A is acyclic; h(A) > 0 if cycles exist.
+    Args:
+        A: (d, d) real-valued adjacency (can be probabilities or weights)
+    Returns:
+        scalar tensor >= 0
+    """
+    d = A.size(0)
+    M = (A * A).to(dtype=torch.float64)  # ensure stability
+    expm_M = torch.matrix_exp(M)
+    return torch.trace(expm_M) - d
+
+
+@torch.no_grad()
+def penalised_edge_score(P: torch.Tensor, lam: float = 1.0, score: str = "prob") -> float:
+    """
+    Example: score a *soft* adjacency by sum of edge scores minus lambda * DAG penalty.
+    You'd normally call an optimiser to adjust A; here we just demonstrate the penalty usage.
+    """
+    if score == "prob":
+        base = float(P.sum().item())
+    elif score == "logit":
+        P_eps = P.clamp_(1e-12, 1 - 1e-12)
+        base = float((torch.log(P_eps) - torch.log(1 - P_eps)).sum().item())
+    else:
+        raise ValueError("score must be 'prob' or 'logit'")
+    penalty = float(notears_acyclicity(P).item())
+    return base - lam * penalty
