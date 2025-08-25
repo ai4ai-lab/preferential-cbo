@@ -106,19 +106,24 @@ def neural_spline_flow(K, D, q0, device, precision_double, hidden_layers=2, hidd
     - device (torch.device): Device to place the flow on.
     - precision_double (bool): Whether to use double precision.
     """
+    # Neural spline flows don't support double precision well: force float32 for stability
+    if precision_double:
+        print("Warning: Neural spline flows don't support double precision. Using float32.")
+        precision_double = False
+        q0 = q0.float()
+    
     flows = []
     for _ in range(K):
         flows.append(nf.flows.AutoregressiveRationalQuadraticSpline(D, hidden_layers, hidden_units))
         flows.append(nf.flows.LULinearPermute(D))
 
-    # Precision: cast whole flow graph
-    if not precision_double:
-        flows = [flow.float() for flow in flows]
-        q0 = q0.float()
+    # Everything in float32
+    flows = [flow.float() for flow in flows]
+    q0 = q0.float()
     
     nfm = nf.NormalizingFlow(q0=q0, flows=flows)
     nfm = nfm.to(device)
-    nfm = nfm.float() if not precision_double else nfm.double()
+    nfm = nfm.float()
 
     # ActNorm warmup: sample to initialize ActNorm parameters
     nfm.eval()
