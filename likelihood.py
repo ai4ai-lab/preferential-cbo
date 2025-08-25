@@ -26,10 +26,10 @@ def exp_rum_pairwise_prob(f_i, f_j, s):
     Exponential RUM pairwise probability P(i beats j).
 
     Uses stable closed form: let z = f_i - f_j, then
-    P = 0.5 - 0.5 * sign(z) * expm1(-s * |z|)
+    P(i > j) = 1 / (1 + exp(-s*(f_i - f_j)))
     """
     z = f_i - f_j
-    return 0.5 - 0.5 * z.sign() * torch.expm1(-s * z.abs())
+    return torch.sigmoid(s * z)
 
 
 def exp_rum_likelihood(f_x, f_others, s, k):
@@ -55,12 +55,24 @@ def exp_rum_likelihood(f_x, f_others, s, k):
     prob = torch.zeros((), device=f_x.device, dtype=f_x.dtype)
     f_star = f_others.max()
 
-    # Precompute terms used in symmetric sums
-    diff_terms = -torch.exp(-s * (f_x - f_others))
+    # Precompute terms used in symmetric sums (working in log space)
+    log_diff_terms = -s * (f_x - f_others)
+
+    # Clamp to prevent overflow in exp
+    log_diff_terms = torch.clamp(log_diff_terms, min=-20, max=20)
+    diff_terms = -torch.exp(log_diff_terms)
 
     for l in range(0, k):
-        # exp(-s * (l+1) * max(f_star - f_x, 0))
-        exp_term = torch.exp(-s * (l + 1) * (torch.clamp(f_star - f_x, min=0)))
+        # Compute exp(-s * (l+1) * max(f_star - f_x, 0))
+        gap = torch.clamp(f_star - f_x, min=0)
+        log_exp_term = -s * (l + 1) * gap
+        
+        # Prevent numerical issues
+        if log_exp_term < -20:
+            exp_term = 0.0
+        else:
+            exp_term = torch.exp(log_exp_term)
+
         factor = 1.0 / (l + 1)
         sym_sum = elementary_symmetric_sum(diff_terms, l)
         prob += factor * exp_term * sym_sum
