@@ -27,6 +27,7 @@ class ParentPosterior:
         b_pi = 1.0,  # prior scale for pi
         device: torch.device | None = None,
         dtype: torch.dtype = torch.float64,
+        tau2_env: float = 10.0,
     ):
         self.d = d
         self.a0 = float(a0)
@@ -38,38 +39,80 @@ class ParentPosterior:
         self.b_pi = float(b_pi)
         self.device = device or torch.device("cpu")
         self.dtype = dtype
+        self.tau2_env = float(tau2_env)
 
-        # Store sufficient statistics
+        self.d_env = 0
         self.reset()
 
     # -------- Core state --------
     def reset(self):
         """ Reset sufficient statistics to zero. """
         self.n = 0
-        self.XtX = torch.zeros((self.d, self.d), dtype=self.dtype, device=self.device)
-        self.Xty = torch.zeros((self.d, 1), dtype=self.dtype, device=self.device)
+        # stats are sized for (parents + env)
+        D_tot = self.d + self.d_env
+        self.XtX = torch.zeros((D_tot, D_tot), dtype=self.dtype, device=self.device)
+        self.Xty = torch.zeros((D_tot, 1), dtype=self.dtype, device=self.device)
         self.yty = torch.tensor(0.0, dtype=self.dtype, device=self.device)
 
-        # Enumerate all subsets as binary masks
+        # Enumerate only parent subsets
         self.masks: List[Tuple[int, ...]] = [tuple(int(b) for b in np.binary_repr(m, width=self.d))
-                                             for m in range(2 ** self.d)]
+                                            for m in range(2 ** self.d)]
         self.log_post = torch.full((2 ** self.d,), -float("inf"), dtype=self.dtype, device=self.device)
         self.post = torch.full_like(self.log_post, fill_value=1.0 / (2 ** self.d))
 
+    # -------- Environment expansion --------
+    def _expand_env(self, k: int):
+        """Dynamically add k environment columns to the sufficient stats (non-destructive)."""
+        if k <= 0:
+            return
+        old_env = self.d_env
+        new_env = old_env + k
+        old_D = self.d + old_env
+        new_D = self.d + new_env
+
+        XtX_new = torch.zeros((new_D, new_D), dtype=self.dtype, device=self.device)
+        Xty_new = torch.zeros((new_D, 1), dtype=self.dtype, device=self.device)
+
+        if old_D > 0:
+            XtX_new[:old_D, :old_D] = self.XtX
+            Xty_new[:old_D, :] = self.Xty
+
+        self.XtX = XtX_new
+        self.Xty = Xty_new
+        # yty and n unchanged
+        self.d_env = new_env
+
     # -------- Data ingestion --------
-    def add_datapoint(self, x, y):
+    def add_datapoint(self, x, y, x_env=None):
         """
-        Consume one observed (x, y), updating sufficient stats.
-        x: (1, d) tensor (executed intervention's X values)
-        y: scalar tensor (observed Y)
+        Consume one observed (x_parents, y) with optional environment one-hot x_env.
+        x: (1, d)       parents
+        x_env: (1, d_env_current) environment dummies (always included in the model)
         """
         x = x.to(self.device, self.dtype)
         if x.dim() == 1:
-            x = x.unsqueeze(0)  # (1, d)
+            x = x.unsqueeze(0)
         y = y.to(self.device, self.dtype).reshape(-1, 1)  # (1,1)
 
-        self.XtX += x.T @ x
-        self.Xty += x.T @ y
+        if x_env is not None:
+            x_env = x_env.to(self.device, self.dtype)
+            if x_env.dim() == 1:
+                x_env = x_env.unsqueeze(0)
+            need_env = x_env.size(1)
+            if need_env > self.d_env:
+                self._expand_env(need_env - self.d_env)
+            z = torch.cat([x, x_env], dim=1)  # (1, d + d_env)
+        else:
+            # assume stats currently match parent-only; if env exists, caller should pass it
+            if self.d_env > 0 and x.size(1) == self.d:
+                # pad implicit zeros for env (safe default)
+                pad = torch.zeros((x.size(0), self.d_env), dtype=self.dtype, device=self.device)
+                z = torch.cat([x, pad], dim=1)
+            else:
+                z = x
+
+        self.XtX += z.T @ z
+        self.Xty += z.T @ y
         self.yty += (y.T @ y).squeeze()
         self.n += 1
 
@@ -87,48 +130,61 @@ class ParentPosterior:
     
     def _log_marginal_likelihood_from_stats(self, XtX, Xty, yty, n, mask):
         """
-        Conjugate log p(y | X_S) for a given mask and provided sufficient stats.
+        Conjugate log p(y | X_S, env) where:
+        - 'mask' selects a subset S of the first 'd' parent columns,
+        - All environment columns (if present) are always included with prior variance tau2_env.
+        XtX/Xty must be formed from the augmented design [parents | env].
         """
-        idx = [i for i, z in enumerate(mask) if z == 1]
-        p = len(idx)
-
-        # Subset prior log p(S)
+        # Prior over the selected parent set S
         logpS = self._log_prior_S(mask)
 
         if n == 0:
-            # Uniform marginal if no data; log evidence cancels out across subsets, keep only prior on S
             return logpS
 
+        # figure out how many env columns are in these stats
+        D_tot = XtX.size(0)
+        d_env = max(0, D_tot - self.d)
+
+        # active indices: selected parents + all env columns
+        idx_par = [i for i, z in enumerate(mask) if z == 1]
+        idx_env = list(range(self.d, self.d + d_env))
+        idx_all = idx_par + idx_env
+        p = len(idx_all)
+
         if p == 0:
-            # No parents: y ~ N(0, sigma^2); marginal integrates out beta trivially
+            # no parents, no env
             a_n = self.a0 + 0.5 * n
             b_n = self.b0 + 0.5 * yty.item()
             log_det_ratio = 0.0
             quad_term = 0.0
         else:
-            XtX_S = XtX[idx][:, idx]  # (p,p)
-            Xty_S = Xty[idx, :]  # (p,1)
+            idx = torch.tensor(idx_all, dtype=torch.long, device=self.device)
+            XtX_S = XtX[idx][:, idx]
+            Xty_S = Xty[idx, :]
 
-            # beta | sigma^2 ~ N(0, sigma^2 tau^2 I) -> V0 = tau^2 I
-            V0_inv = (1.0 / self.tau2) * torch.eye(p, dtype=self.dtype, device=self.device)
-            Vn_inv = V0_inv + XtX_S
+            # diagonal prior precision: parents use tau2, env use tau2_env
+            n_par = len(idx_par)
+            n_env = len(idx_env)
+            prior_prec = torch.full((p,), 1.0 / self.tau2, dtype=self.dtype, device=self.device)
+            if n_env > 0:
+                prior_prec[-n_env:] = 1.0 / self.tau2_env
 
-            # Cholesky for stability
+            Vn_inv = XtX_S + torch.diag(prior_prec)
+
             L = torch.linalg.cholesky(Vn_inv)
             logdet_Vn_inv = 2.0 * torch.sum(torch.log(torch.diag(L)))
             logdet_Vn = -logdet_Vn_inv
 
-            logdet_V0 = p * math.log(self.tau2)
+            # log |V0| for mixed block
+            logdet_V0 = n_par * math.log(self.tau2) + n_env * math.log(self.tau2_env)
             log_det_ratio = logdet_V0 - logdet_Vn
 
-            # (X^T y)^T Vn^{-1} (X^T y)
             u = torch.cholesky_solve(Xty_S, L)
             quad_term = (Xty_S.T @ u).item()
 
             a_n = self.a0 + 0.5 * n
             b_n = self.b0 + 0.5 * (yty.item() - quad_term)
 
-        # log p(y|X_S) up to constants common across S
         log_ml = (
             0.5 * log_det_ratio
             + self.a0 * math.log(self.b0)
@@ -137,7 +193,6 @@ class ParentPosterior:
             - torch.lgamma(torch.tensor(self.a0, dtype=self.dtype)).item()
             - 0.5 * n * math.log(2.0 * math.pi)
         )
-
         return logpS + log_ml
 
     def _posterior_from_stats(self, XtX, Xty, yty, n):
@@ -190,37 +245,66 @@ class ParentPosterior:
     
     # -------- "peek" (non-mutating) utilities for EEIG --------
     @torch.no_grad()
-    def peek_update_edge_posterior(self, x_new, y_new):
+    def peek_update_edge_posterior_aug(self, x_par, y, x_env=None):
         """
-        Return edge posterior vector AFTER a virtual update with (x_new, y_new), without modifying internal state.
+        Like edge_posterior() after a virtual update with (x_par, y, x_env), without mutating state.
+        Handles env size larger than current by zero-padding a local copy of stats.
         """
-        x = x_new.to(self.device, self.dtype)
-        if x.dim() == 1:
-            x = x.unsqueeze(0)
-        y = y_new.to(self.device, self.dtype).reshape(-1, 1)
+        x_par = x_par.to(self.device, self.dtype)
+        if x_par.dim() == 1:
+            x_par = x_par.unsqueeze(0)
+        y = y.to(self.device, self.dtype).reshape(-1, 1)
 
-        XtX_new = self.XtX + x.T @ x
-        Xty_new = self.Xty + x.T @ y
+        # assemble z and a temporary stats buffer (pad if env is new)
+        if x_env is not None:
+            x_env = x_env.to(self.device, self.dtype)
+            if x_env.dim() == 1:
+                x_env = x_env.unsqueeze(0)
+            need_env = x_env.size(1)
+        else:
+            need_env = self.d_env
+
+        old_D = self.d + self.d_env
+        new_D = self.d + need_env
+        XtX_use = self.XtX
+        Xty_use = self.Xty
+        if new_D > old_D:
+            XtX_pad = torch.zeros((new_D, new_D), dtype=self.dtype, device=self.device)
+            Xty_pad = torch.zeros((new_D, 1), dtype=self.dtype, device=self.device)
+            if old_D > 0:
+                XtX_pad[:old_D, :old_D] = self.XtX
+                Xty_pad[:old_D, :] = self.Xty
+            XtX_use, Xty_use = XtX_pad, Xty_pad
+
+        if x_env is None:
+            if new_D > self.d:
+                x_env = torch.zeros((1, new_D - self.d), dtype=self.dtype, device=self.device)
+            else:
+                x_env = torch.zeros((1, 0), dtype=self.dtype, device=self.device)
+
+        z = torch.cat([x_par, x_env], dim=1)
+        XtX_new = XtX_use + z.T @ z
+        Xty_new = Xty_use + z.T @ y
         yty_new = self.yty + (y.T @ y).squeeze()
         n_new = self.n + 1
 
         post_new = self._posterior_from_stats(XtX_new, Xty_new, yty_new, n_new)
 
-        # Marginalize to edge probabilities
         pj = torch.zeros(self.d, dtype=self.dtype, device=self.device)
         for mask, pS in zip(self.masks, post_new):
-            for j, z in enumerate(mask):
-                if z == 1:
+            for j, zbit in enumerate(mask):
+                if zbit == 1:
                     pj[j] += pS
         return pj
 
     @torch.no_grad()
-    def peek_update_edge_entropy(self, x_new, y_new):
-        """
-        Return sum_j H(edge_j | data & {(x_new,y_new)}), where H is Bernoulli entropy.
-        Useful as an "expected posterior entropy" term for EEIG.
-        """
-        pj = self.peek_update_edge_posterior(x_new, y_new)
+    def peek_update_edge_posterior(self, x_new, y_new):
+        # Backward-compatible wrapper: parent-only, no env
+        return self.peek_update_edge_posterior_aug(x_new, y_new, x_env=None)
+
+    @torch.no_grad()
+    def peek_update_edge_entropy(self, x_new, y_new, x_env=None):
+        pj = self.peek_update_edge_posterior_aug(x_new, y_new, x_env=x_env)
         eps = torch.tensor(1e-12, dtype=self.dtype, device=self.device)
         H = -(pj * torch.log(pj + eps) + (1 - pj) * torch.log(1 - pj + eps))
         return H.sum()
@@ -236,6 +320,7 @@ class LocalParentPosterior(ParentPosterior):
         super().__init__(d=len(parent_idx), **kwargs)
         self.parent_idx = list(parent_idx)
         self.target_idx = int(target_idx)
+        self.env_map = {}  # global_node -> local env column index
 
     def slice_xy(self, outcome):
         out = outcome.to(self.device, self.dtype).view(-1)
@@ -244,14 +329,34 @@ class LocalParentPosterior(ParentPosterior):
         return x, y
 
     def add_datapoint_full(self, outcome, do_idx):
-        # Only skip when we intervened on the target itself
         if do_idx == self.target_idx:
             return
         x, y = self.slice_xy(outcome)
-        super().add_datapoint(x, y)  # update XtX/Xty/yty/n
+        x_env = self._x_env_onehot(int(do_idx))
+        super().add_datapoint(x, y, x_env=x_env)
     
     def num_datapoints(self) -> int:
         return int(self.n)
+    
+    def _x_env_onehot(self, do_idx: int):
+        """
+        Return (1, d_env) one-hot for the intervened node (excluding the target).
+        Dynamically expands parent stats with a new env column when a new do_idx appears.
+        """
+        if do_idx == self.target_idx:
+            # env is "off" when we intervene on the target itself
+            if self.d_env == 0:
+                return torch.zeros((1, 0), dtype=self.dtype, device=self.device)
+            return torch.zeros((1, self.d_env), dtype=self.dtype, device=self.device)
+
+        if do_idx not in self.env_map:
+            # allocate a fresh env column
+            super()._expand_env(1)
+            self.env_map[do_idx] = self.d_env - 1  # last index
+
+        v = torch.zeros((1, self.d_env), dtype=self.dtype, device=self.device)
+        v[0, self.env_map[do_idx]] = 1.0
+        return v
 
     
     # --------- Peeking helpers ---------
@@ -260,7 +365,8 @@ class LocalParentPosterior(ParentPosterior):
         if intervened_idx == self.target_idx:
             return self.edge_posterior()
         x, y = self.slice_xy(outcome)
-        return self.peek_update_edge_posterior(x, y)
+        x_env = self._x_env_onehot(int(intervened_idx)) if intervened_idx is not None else None
+        return self.peek_update_edge_posterior_aug(x, y, x_env=x_env)
 
     @torch.no_grad()
     def peek_update_edge_entropy_full(self, outcome, intervened_idx=None):
@@ -270,7 +376,8 @@ class LocalParentPosterior(ParentPosterior):
             H = -(pj * torch.log(pj + eps) + (1 - pj) * torch.log(1 - pj + eps))
             return H.sum()
         x, y = self.slice_xy(outcome)
-        return self.peek_update_edge_entropy(x, y)
+        x_env = self._x_env_onehot(int(intervened_idx)) if intervened_idx is not None else None
+        return self.peek_update_edge_entropy(x, y, x_env=x_env)
     
     @torch.no_grad()
     def peek_update_edge_entropy_batch(self, X_batch, y_batch):
@@ -406,36 +513,3 @@ def greedy_map_dag_from_edge_matrix(
         reach[:, v] = reach[:, v] | new_reach_to_v
 
     return A
-
-
-def notears_acyclicity(A: torch.Tensor) -> torch.Tensor:
-    """
-    Smooth acyclicity measure from NOTEARS:
-      h(A) = trace(expm(A ∘ A)) - d
-    h(A) == 0 iff A is acyclic; h(A) > 0 if cycles exist.
-    Args:
-        A: (d, d) real-valued adjacency (can be probabilities or weights)
-    Returns:
-        scalar tensor >= 0
-    """
-    d = A.size(0)
-    M = (A * A).to(dtype=torch.float64)  # ensure stability
-    expm_M = torch.matrix_exp(M)
-    return torch.trace(expm_M) - d
-
-
-@torch.no_grad()
-def penalised_edge_score(P: torch.Tensor, lam: float = 1.0, score: str = "prob") -> float:
-    """
-    Example: score a *soft* adjacency by sum of edge scores minus lambda * DAG penalty.
-    You'd normally call an optimiser to adjust A; here we just demonstrate the penalty usage.
-    """
-    if score == "prob":
-        base = float(P.sum().item())
-    elif score == "logit":
-        P_eps = P.clamp_(1e-12, 1 - 1e-12)
-        base = float((torch.log(P_eps) - torch.log(1 - P_eps)).sum().item())
-    else:
-        raise ValueError("score must be 'prob' or 'logit'")
-    penalty = float(notears_acyclicity(P).item())
-    return base - lam * penalty
