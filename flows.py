@@ -95,6 +95,7 @@ def residual_flow(K, D, q0, device, precision_double, hidden_units=50, hidden_la
 
     return nfm
 
+
 def neural_spline_flow(K, D, q0, device, precision_double, hidden_layers=2, hidden_units=128):
     """
     Build a Neural Spline Flow with Autoregressive Rational Quadratic Spline and LULinearPermute.
