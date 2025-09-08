@@ -44,18 +44,27 @@ class CausalDiscoveryBaselines:
         LASSO regression for each node to identify parents.
         Simple but often effective baseline.
         """
-        X, _ = self.get_data_matrix()
+        X, interventions = self.get_data_matrix()
         if X is None or len(X) < 10:
             return self.random_baseline()
         
         adj = np.zeros((self.n_nodes, self.n_nodes))
         
         for target in range(self.n_nodes):
-            mask = np.ones(self.n_nodes, dtype=bool)
-            mask[target] = False
+            # Only use data where target wasn't intervened on
+            if interventions is not None:
+                mask_valid = (interventions != target)
+                X_valid = X[mask_valid]
+                if len(X_valid) < 5:
+                    continue
+            else:
+                X_valid = X
+                
+            mask_features = np.ones(self.n_nodes, dtype=bool)
+            mask_features[target] = False
             
-            X_parents = X[:, mask]
-            y_target = X[:, target]
+            X_parents = X_valid[:, mask_features]
+            y_target = X_valid[:, target]
 
             # Standardize features
             scaler_X = StandardScaler()
@@ -69,7 +78,7 @@ class CausalDiscoveryBaselines:
                 lasso.fit(X_scaled, y_scaled)
                 
                 # Non-zero coefficients indicate edges
-                parent_idx = np.where(mask)[0]
+                parent_idx = np.where(mask_features)[0]
                 for i, coef in enumerate(lasso.coef_):
                     if abs(coef) > 0.01:  # Threshold for considering an edge
                         adj[parent_idx[i], target] = 1
@@ -87,18 +96,24 @@ class CausalDiscoveryBaselines:
         Simplified PC algorithm: finds skeleton using correlation tests.
         Note: This is a simplified version without orientation rules.
         """
-        X, _ = self.get_data_matrix()
+        X, interventions = self.get_data_matrix()
         if X is None or len(X) < 20:
             return self.random_baseline()
         
-        # Start with complete graph
         adj = np.ones((self.n_nodes, self.n_nodes)) - np.eye(self.n_nodes)
         
         # Test marginal independence
         for i in range(self.n_nodes):
             for j in range(i+1, self.n_nodes):
-                # Test correlation
-                corr, p_value = stats.pearsonr(X[:, i], X[:, j])
+                if interventions is not None:
+                    mask = (interventions != i) & (interventions != j)
+                    X_obs = X[mask]
+                    if len(X_obs) < 10:
+                        continue
+                else:
+                    X_obs = X
+                    
+                corr, p_value = stats.pearsonr(X_obs[:, i], X_obs[:, j])
                 if p_value > alpha:
                     adj[i, j] = 0
                     adj[j, i] = 0
@@ -108,21 +123,38 @@ class CausalDiscoveryBaselines:
             for j in range(i+1, self.n_nodes):
                 if adj[i, j] == 0:
                     continue
+
+                if interventions is not None:
+                    mask_ij = (interventions != i) & (interventions != j)
+                    X_for_test = X[mask_ij]
+                    if len(X_for_test) < 10:
+                        continue
+                else:
+                    X_for_test = X
                     
                 # Test conditioning on each other variable
                 for k in range(self.n_nodes):
                     if k == i or k == j:
                         continue
+
+                    # Exclude interventions on k for conditioning
+                    if interventions is not None:
+                        mask_final = mask_ij & (interventions != k)
+                        X_final = X[mask_final]
+                        if len(X_final) < 10:
+                            continue
+                    else:
+                        X_final = X_for_test
                     
                     try:
                         # Calculate partial correlation
-                        resid_i = X[:, i] - LinearRegression().fit(
-                            X[:, k].reshape(-1, 1), X[:, i]
-                        ).predict(X[:, k].reshape(-1, 1))
+                        resid_i = X_final[:, i] - LinearRegression().fit(
+                            X_final[:, k].reshape(-1, 1), X_final[:, i]
+                        ).predict(X_final[:, k].reshape(-1, 1))
                         
-                        resid_j = X[:, j] - LinearRegression().fit(
-                            X[:, k].reshape(-1, 1), X[:, j]
-                        ).predict(X[:, k].reshape(-1, 1))
+                        resid_j = X_final[:, j] - LinearRegression().fit(
+                            X_final[:, k].reshape(-1, 1), X_final[:, j]
+                        ).predict(X_final[:, k].reshape(-1, 1))
                         
                         corr, p_value = stats.pearsonr(resid_i, resid_j)
                         if p_value > alpha:
@@ -136,12 +168,22 @@ class CausalDiscoveryBaselines:
     
     def _orient_skeleton(self, skeleton):
         """Orient edges in skeleton to form DAG"""
-        X, _ = self.get_data_matrix()
+        X, interventions = self.get_data_matrix()
         if X is None:
             return np.triu(skeleton, k=1)
         
-        # Order nodes by variance (assumption: causes have higher variance)
-        variances = np.var(X, axis=0)
+        # Calculate variance only from non-intervened data for each node
+        variances = np.zeros(self.n_nodes)
+        for i in range(self.n_nodes):
+            if interventions is not None:
+                mask = (interventions != i)
+                if mask.sum() > 0:
+                    variances[i] = np.var(X[mask, i])
+                else:
+                    variances[i] = np.var(X[:, i])  # fallback
+            else:
+                variances[i] = np.var(X[:, i])
+        
         order = np.argsort(-variances)
         
         # Create DAG following this order
@@ -221,48 +263,58 @@ class CausalDiscoveryBaselines:
 
         return A
     
-    def causal_sufficiency(self, alpha=0.05, min_per_group=3, min_abs_effect=0.0):
+    def causal_sufficiency(self, alpha=0.05, min_per_group=10, only_direct=True):
         """
         Heuristic: add i->j if do(X_i) shifts X_j.
         - Uses Welch's t-test between rows where intervention==i vs !=i.
         - Skips tiny effects if |mean_diff| < min_abs_effect (optional).
         """
         X, interventions = self.get_data_matrix()
-        if X is None or len(X) < 10:
+        if X is None or len(X) < 30:
             return self.random_baseline()
-
+        
         d = self.n_nodes
-        A = np.zeros((d, d), dtype=int)
-
-        # If we don't know which rows were intervened on, bail to random
-        if interventions is None or interventions.shape[0] != X.shape[0]:
-            return self.random_baseline()
-
+        # First pass: find all potential edges
+        potential = np.zeros((d, d))
+        
         for i in range(d):
-            mask = (interventions == i)
-            n_t = int(mask.sum())
-            n_c = int((~mask).sum())
-            if n_t < min_per_group or n_c < min_per_group:
-                continue  # not enough data for this do(i)
-
-            X_t = X[mask]    # rows where we intervened on i
-            X_c = X[~mask]   # rows where we did not
-
+            mask_i = (interventions == i)
+            mask_not_i = (interventions != i)
+            
+            if mask_i.sum() < min_per_group or mask_not_i.sum() < min_per_group:
+                continue
+                
+            X_do_i = X[mask_i]
+            X_no_do_i = X[mask_not_i]
+            
             for j in range(d):
                 if j == i:
                     continue
-                # quick guard on effect size if desired
-                diff = float(np.nanmean(X_t[:, j]) - np.nanmean(X_c[:, j]))
-                if abs(diff) < float(min_abs_effect):
+                
+                # Test if intervention on i affects j
+                _, p = stats.ttest_ind(X_do_i[:, j], X_no_do_i[:, j], equal_var=False)
+                if p < alpha:
+                    potential[i, j] = 1
+        
+        if not only_direct:
+            return potential.astype(int)
+        
+        # Second pass: remove indirect edges
+        # If i->k and k->j exist, remove i->j
+        adj = potential.copy()
+        for i in range(d):
+            for j in range(d):
+                if potential[i, j] == 0:
                     continue
-                try:
-                    _, p = stats.ttest_ind(X_t[:, j], X_c[:, j], equal_var=False)
-                    if np.isfinite(p) and p < alpha:
-                        A[i, j] = 1
-                except Exception:
-                    pass
-
-        return A
+                # Check for indirect path
+                for k in range(d):
+                    if k != i and k != j:
+                        if potential[i, k] == 1 and potential[k, j] == 1:
+                            # Found indirect path, remove direct edge
+                            adj[i, j] = 0
+                            break
+        
+        return adj.astype(int)
     
     def _project_to_dag(self, W):
         """Project weight matrix to DAG by removing cycles"""
