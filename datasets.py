@@ -458,7 +458,7 @@ class PCBO_ERDataset(Dataset):
 class PCBO_MedicalDataset(Dataset):
     """
     A small 'medical' DAG (treatment, biomarkers, risk factors, outcome).
-    Nodes: T, Age, Smoke, BMI, BP, Biom1, Biom2, Outcome
+    Nodes: Treat, Age, Smoke, BMI, BP, Biom1, Biom2, Out
     """
     def __init__(self, n_queries=100, noise_std=0.1, domain=(-2.0, 2.0), seed=42):
         super().__init__()
@@ -469,7 +469,7 @@ class PCBO_MedicalDataset(Dataset):
         self.seed = seed
         self.rng = _make_rng(seed)
         
-        self.node_names = ["T", "Age", "Smoke", "BMI", "BP", "Biom1", "Biom2", "Outcome"]
+        self.node_names = ["Treat", "Age", "Smoke", "BMI", "BP", "Biom1", "Biom2", "Out"]
         
         # Build adjacency matrix
         A = np.zeros((8, 8), dtype=np.int64)
