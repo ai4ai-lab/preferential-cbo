@@ -263,57 +263,119 @@ class CausalDiscoveryBaselines:
 
         return A
     
-    def causal_sufficiency(self, alpha=0.05, min_per_group=10, only_direct=True):
+    def causal_sufficiency(self, alpha=0.05, min_per_group=10, min_abs_shift=0.15,
+                           use_fdr=True, only_direct=True):
         """
-        Heuristic: add i->j if do(X_i) shifts X_j.
-        - Uses Welch's t-test between rows where intervention==i vs !=i.
-        - Skips tiny effects if |mean_diff| < min_abs_effect (optional).
+        Heuristic: add i->j if do(X_i) shifts X_j (Welch t-test) with clean controls,
+        effect-size filter, and light transitive pruning.
         """
         X, interventions = self.get_data_matrix()
         if X is None or len(X) < 30:
             return self.random_baseline()
-        
+
         d = self.n_nodes
-        # First pass: find all potential edges
-        potential = np.zeros((d, d))
-        
+        potential = np.zeros((d, d), dtype=float)  # store a 'strength' score
+
+        # First pass: per (i -> j) test with clean controls
+        pvals = []
+        pairs = []
+        shifts = []  # mean shift |E[X_j | do(i)] - E[X_j | not i, not j]|
+
         for i in range(d):
-            mask_i = (interventions == i)
-            mask_not_i = (interventions != i)
-            
-            if mask_i.sum() < min_per_group or mask_not_i.sum() < min_per_group:
+            treated = (interventions == i)
+            if treated.sum() < min_per_group:
                 continue
-                
-            X_do_i = X[mask_i]
-            X_no_do_i = X[mask_not_i]
-            
+            X_t = X[treated]
+
             for j in range(d):
                 if j == i:
                     continue
-                
-                # Test if intervention on i affects j
-                _, p = stats.ttest_ind(X_do_i[:, j], X_no_do_i[:, j], equal_var=False)
-                if p < alpha:
-                    potential[i, j] = 1
-        
+                control = (interventions != i) & (interventions != j)
+                if control.sum() < min_per_group:
+                    continue
+                X_c = X[control]
+
+                # test on X_j
+                y_t = X_t[:, j]
+                y_c = X_c[:, j]
+
+                # Welch t-test
+                tstat, p = stats.ttest_ind(y_t, y_c, equal_var=False)
+                # effect size: absolute mean shift (units of variable scale)
+                shift = float(np.abs(y_t.mean() - y_c.mean()))
+
+                pvals.append(p)
+                pairs.append((i, j))
+                shifts.append(shift)
+
+        # Multiple-testing control
+        keep = np.ones(len(pvals), dtype=bool)
+        if len(pvals) and use_fdr:
+            # Benjamini–Hochberg
+            order = np.argsort(pvals)
+            m = len(pvals)
+            thresh = np.array([(k+1)/m * alpha for k in range(m)], dtype=float)
+            passed = np.zeros(m, dtype=bool)
+            running = 0
+            for rank, idx in enumerate(order):
+                if pvals[idx] <= thresh[rank]:
+                    running = rank
+                    passed[rank] = True
+            # allow all up to last passing rank
+            if passed.any():
+                last = np.max(np.nonzero(passed))
+                mask_bh = np.zeros(m, dtype=bool); mask_bh[order[:last+1]] = True
+                keep &= mask_bh
+            else:
+                keep &= False
+        else:
+            keep &= (np.array(pvals) <= alpha)
+
+        # effect size filter
+        keep &= (np.array(shifts) >= min_abs_shift)
+
+        for k, flag in enumerate(keep):
+            if not flag: 
+                continue
+            i, j = pairs[k]
+            # use a simple 'strength' = shift / (p + eps)
+            potential[i, j] = shifts[k] / (pvals[k] + 1e-12)
+
         if not only_direct:
-            return potential.astype(int)
-        
-        # Second pass: remove indirect edges
-        # If i->k and k->j exist, remove i->j
-        adj = potential.copy()
+            return (potential > 0).astype(int)
+
+        # Second pass: evidence-based pruning of indirects
+        adj = (potential > 0).astype(int)
+        # Sort candidate 2-hop paths roughly by weakest link strength
         for i in range(d):
             for j in range(d):
-                if potential[i, j] == 0:
+                if i == j or adj[i, j] == 0:
                     continue
-                # Check for indirect path
+                # look for mediators k
                 for k in range(d):
-                    if k != i and k != j:
-                        if potential[i, k] == 1 and potential[k, j] == 1:
-                            # Found indirect path, remove direct edge
-                            adj[i, j] = 0
-                            break
-        
+                    if k == i or k == j: 
+                        continue
+                    if adj[i, k] and adj[k, j]:
+                        # Only drop i->j if its 'strength' is clearly weaker than the 2-hop path
+                        if potential[i, j] < min(potential[i, k], potential[k, j]):
+                            # Conditional re-test: is i->j still significant given k?
+                            # Quick regression residual check:
+                            try:
+                                y = X[interventions != j, j]
+                                Xi = X[interventions != j, i]
+                                Xk = X[interventions != j, k].reshape(-1, 1)
+                                # regress out k
+                                resid_y = y - LinearRegression().fit(Xk, y).predict(Xk)
+                                resid_i = Xi - LinearRegression().fit(Xk, Xi).predict(Xk)
+                                _, p_cond = stats.pearsonr(resid_i, resid_y)
+                                if p_cond > alpha:
+                                    adj[i, j] = 0
+                                    break
+                            except Exception:
+                                # Fall back to strength comparison only
+                                adj[i, j] = 0
+                                break
+
         return adj.astype(int)
     
     def _project_to_dag(self, W):
