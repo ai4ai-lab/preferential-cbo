@@ -40,7 +40,9 @@ preferential-cbo/
 ├── parent_posterior_scalable.py   # MCMC-based scalable local posterior
 ├── baselines.py   # Random, LASSO, PC-lite, NOTEARS-lite, interventional t-tests
 ├── figures/   # Generated plots
-└── requirements.txt
+├── requirements.txt
+├── report.pdf   # Full report of the project
+└── presentation.pdf   # Presentation slides
 ```
 
 
