@@ -1,0 +1,27 @@
+[submodule "baselines/notears"]
+	path = baselines/notears
+	url = https://github.com/xunzheng/notears
+[submodule "baselines/dagma"]
+	path = baselines/dagma
+	url = https://github.com/kevinsbello/dagma
+[submodule "baselines/golem"]
+	path = baselines/golem
+	url = https://github.com/ignavierng/golem
+[submodule "baselines/cbo"]
+	path = baselines/cbo
+	url = https://github.com/VirgiAgl/CausalBayesianOptimization
+[submodule "baselines/cbo-u"]
+	path = baselines/cbo-u
+	url = https://github.com/ai4ai-lab/causal_bayes_opt
+[submodule "baselines/alias"]
+	path = baselines/alias
+	url = https://github.com/baosws/ALIAS
+[submodule "baselines/cosmo"]
+	path = baselines/cosmo
+	url = https://github.com/rmassidda/cosmo
+[submodule "baselines/drbo"]
+	path = baselines/drbo
+	url = https://github.com/baosws/DrBO
+[submodule "baselines/corl"]
+	path = baselines/corl
+	url = https://github.com/huawei-noah/trustworthyAI
