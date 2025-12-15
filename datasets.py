@@ -1,4 +1,5 @@
 import torch
+import os
 import numpy as np
 from torch.utils.data import Dataset
 
@@ -591,3 +592,312 @@ class PCBO_MedicalDataset(Dataset):
     
     def __getitem__(self, idx):
         return self.queries[idx]
+    
+
+# =========================================================================
+# BIF / BNLearn datasets (alarm, asia, cancer, child, earthquake, diabetes)
+# =========================================================================
+
+try:
+    from pgmpy.readwrite import BIFReader
+except Exception:
+    BIFReader = None
+
+
+def _load_bif_model(bif_path: str):
+    if BIFReader is None:
+        raise ImportError("pgmpy is required for BIF datasets. Install with: pip install pgmpy")
+    reader = BIFReader(bif_path)
+    model = reader.get_model()
+    return model
+
+
+def _adj_from_model(model, node_order):
+    """Binary adjacency A[i,j]=1 if node_order[i] -> node_order[j]."""
+    idx = {n: i for i, n in enumerate(node_order)}
+    d = len(node_order)
+    A = np.zeros((d, d), dtype=np.int64)
+    for u, v in model.edges():
+        if u in idx and v in idx:
+            A[idx[u], idx[v]] = 1
+    np.fill_diagonal(A, 0)
+    return A
+
+
+def _topo_order_from_edges(nodes, edges):
+    """Deterministic Kahn topo-sort without networkx dependency."""
+    nodes = list(nodes)
+    indeg = {n: 0 for n in nodes}
+    children = {n: [] for n in nodes}
+
+    for u, v in edges:
+        if u not in indeg or v not in indeg:
+            continue
+        children[u].append(v)
+        indeg[v] += 1
+
+    # deterministic: initial queue respects nodes order
+    queue = [n for n in nodes if indeg[n] == 0]
+    out = []
+
+    while queue:
+        n = queue.pop(0)
+        out.append(n)
+        for c in children[n]:
+            indeg[c] -= 1
+            if indeg[c] == 0:
+                queue.append(c)
+
+    # If something goes wrong (shouldn't for a BN), fallback to given order
+    if len(out) != len(nodes):
+        return nodes
+    return out
+
+
+def _sample_from_cpd_values(cpd_values: np.ndarray, parent_values: list[int] | None, rng: np.random.Generator) -> int:
+    """
+    cpd_values: ndarray shaped (card_child, card_pa1, card_pa2, ...)
+    parent_values: list of int states in EXACT order of cpd.variables[1:].
+    """
+    arr = np.asarray(cpd_values, dtype=np.float64)
+
+    if parent_values is None or len(parent_values) == 0:
+        probs = arr.reshape(-1)  # (card_child,)
+    else:
+        slicer = (slice(None),) + tuple(int(v) for v in parent_values)
+        probs = arr[slicer].reshape(-1)  # (card_child,)
+
+    s = probs.sum()
+    if s <= 0:
+        # extremely defensive: fallback to uniform
+        probs = np.ones_like(probs, dtype=np.float64) / len(probs)
+    else:
+        probs = probs / s
+
+    return int(rng.choice(len(probs), p=probs))
+
+
+class PCBO_BIFDataset(Dataset):
+    """
+    Generic wrapper for BNLearn-style .bif Bayesian networks.
+
+    Files expected:
+        data_dir/{name}.bif   e.g. data/alarm.bif
+
+    Interventions:
+        do(X_i = state_index), where state_index in [0, card_i-1].
+
+    Outcomes:
+        full assignment vector (d,) stored as float32 tensor
+        (values are integer-coded states, but float32 for your flow).
+
+    Preferences:
+        pairwise (k=2). Winner chosen by utility.
+
+    Utility:
+        default: make target node hit `desired_state`:
+            u = -abs(x[target]-desired_state) - intervention_cost
+    """
+
+    def __init__(
+        self,
+        name: str,
+        data_dir: str = "data",
+        n_queries: int = 100,
+        seed: int = 42,
+        intervention_cost: float = 0.1,
+        target_node: str | None = None,  # if None -> last node in node_names
+        desired_state: int = 0,
+        allowed_intervention_nodes: list[str] | None = None,  # list of node names
+    ):
+        super().__init__()
+        self.name = str(name)
+        self.data_dir = str(data_dir)
+        self.n_queries = int(n_queries)
+        self.seed = int(seed)
+        self.intervention_cost = float(intervention_cost)
+
+        bif_path = os.path.join(self.data_dir, f"{self.name}.bif")
+        if not os.path.exists(bif_path):
+            raise FileNotFoundError(f"Could not find BIF file: {bif_path}")
+
+        self._np_rng = np.random.default_rng(self.seed)
+        self._torch_rng = torch.Generator().manual_seed(self.seed)
+
+        # --- Load BN model ---
+        self.model = _load_bif_model(bif_path)
+
+        # Stable node order
+        self.node_names = list(self.model.nodes())
+        self.n_nodes = len(self.node_names)
+        self.name_to_idx = {n: i for i, n in enumerate(self.node_names)}
+
+        # Adjacency
+        self.adj = torch.tensor(_adj_from_model(self.model, self.node_names), dtype=torch.int64)
+
+        # CPDs map
+        cpds = {cpd.variable: cpd for cpd in self.model.get_cpds()}
+        missing = [n for n in self.node_names if n not in cpds]
+        if missing:
+            raise ValueError(f"Missing CPDs for nodes: {missing}")
+        self.cpds = cpds
+
+        # Cardinalities in node order (list indexed by node index)
+        self.cardinalities = [int(self.model.get_cardinality(v)) for v in self.node_names]
+
+        # Target setup
+        if target_node is None:
+            self.target_idx = self.n_nodes - 1
+        else:
+            if target_node not in self.name_to_idx:
+                raise ValueError(f"target_node='{target_node}' not found. Available: {self.node_names}")
+            self.target_idx = self.name_to_idx[target_node]
+
+        self.desired_state = int(desired_state)
+        target_card = self.cardinalities[self.target_idx]
+        if not (0 <= self.desired_state < target_card):
+            raise ValueError(f"desired_state={self.desired_state} out of range for target card={target_card}")
+
+        # Allowed intervention nodes -> indices
+        if allowed_intervention_nodes is None:
+            self.allowed_nodes = list(range(self.n_nodes))
+        else:
+            for n in allowed_intervention_nodes:
+                if n not in self.name_to_idx:
+                    raise ValueError(f"allowed_intervention_nodes contains unknown node '{n}'.")
+            self.allowed_nodes = [self.name_to_idx[n] for n in allowed_intervention_nodes]
+
+        # Topological order (as names)
+        self._topo = _topo_order_from_edges(self.node_names, list(self.model.edges()))
+
+        # Generate queries
+        self.queries = self._generate_pairwise_data(self.n_queries)
+
+    # ---------------- Public API ----------------
+    def get_causal_graph(self):
+        return self.adj.clone(), list(self.node_names)
+
+    def __len__(self):
+        return self.n_queries
+
+    def __getitem__(self, idx):
+        return self.queries[idx]
+
+    # ---------------- PCBO sampling ----------------
+    def _sample_intervention(self):
+        # choose node index from allowed_nodes
+        j = int(torch.randint(0, len(self.allowed_nodes), (1,), generator=self._torch_rng).item())
+        node_idx = int(self.allowed_nodes[j])
+
+        card = int(self.cardinalities[node_idx])
+        val = int(self._np_rng.integers(0, card))
+        return node_idx, val
+
+    def _true_utility(self, outcome_vec: torch.Tensor, intervention_node: int | None):
+        # outcome_vec stores integer-coded states as float32
+        u = -torch.abs(outcome_vec[self.target_idx] - float(self.desired_state))
+        if intervention_node is not None:
+            u = u - self.intervention_cost
+        return u
+
+    def _sample_assignment_do(self, do_node_idx: int, do_value: int) -> np.ndarray:
+        """
+        Ancestral sampling under hard do(X_do=do_value).
+        """
+        do_node = self.node_names[do_node_idx]
+        assn = {n: None for n in self.node_names}
+        assn[do_node] = int(do_value)
+
+        for node in self._topo:
+            if assn[node] is not None:
+                continue
+
+            cpd = self.cpds[node]
+            # IMPORTANT: pgmpy convention: cpd.variables = [child, parent1, parent2, ...]
+            parents = list(cpd.variables[1:])
+
+            if parents:
+                parent_vals = []
+                for p in parents:
+                    pv = assn[p]
+                    if pv is None:
+                        # if topo order is correct, this shouldn't happen;
+                        # fallback: sample parent first from its marginal
+                        parent_cpd = self.cpds[p]
+                        pv = _sample_from_cpd_values(parent_cpd.values, None, self._np_rng)
+                        assn[p] = int(pv)
+
+                    # sanity: check within parent cardinality
+                    p_idx = self.name_to_idx[p]
+                    p_card = self.cardinalities[p_idx]
+                    if not (0 <= int(pv) < int(p_card)):
+                        raise RuntimeError(f"Invalid parent state: {p}={pv} but card={p_card}")
+
+                    parent_vals.append(int(pv))
+
+                x = _sample_from_cpd_values(cpd.values, parent_vals, self._np_rng)
+            else:
+                x = _sample_from_cpd_values(cpd.values, None, self._np_rng)
+
+            assn[node] = int(x)
+
+        x_vec = np.array([assn[n] for n in self.node_names], dtype=np.int64)
+        return x_vec
+
+    def _generate_pairwise_data(self, n_queries: int):
+        qs = []
+        for _ in range(n_queries):
+            intervs, outs, utils = [], [], []
+
+            for _ in range(2):
+                node, val = self._sample_intervention()
+                x = self._sample_assignment_do(node, val)
+                out = torch.tensor(x, dtype=torch.float32)
+                util = self._true_utility(out, node)
+
+                intervs.append((node, val))
+                outs.append(out)
+                utils.append(util)
+
+            outs = torch.stack(outs, dim=0)
+            utils = torch.stack(utils, dim=0).squeeze(-1)
+            winner_idx = int(torch.argmax(utils).item())
+
+            qs.append({
+                "interventions": intervs,
+                "outcomes": outs,
+                "utilities": utils,
+                "winner_idx": winner_idx,
+            })
+
+        return qs
+    
+    def _compute_intervention_outcome(self, node_idx: int, value):
+        """
+        Compatibility method with your existing PCBO code.
+
+        For BIF datasets, interventions are discrete:
+            do(X_node_idx = state_index)
+
+        If value is a float (e.g., -1.5, 0.0, 1.5), we map it to a valid state index.
+        """
+        card = int(self.cardinalities[int(node_idx)])
+
+        # Map continuous values to discrete states if needed
+        if isinstance(value, (float, np.floating)) or (isinstance(value, torch.Tensor) and value.ndim == 0):
+            v = float(value)
+            # simple robust mapping: quantize into {0, ..., card-1}
+            if card == 1:
+                state = 0
+            else:
+                # map [-inf, +inf] -> [0, card-1] via tanh then scaling
+                z = np.tanh(v)  # [-1, 1]
+                state = int(np.round((z + 1.0) * 0.5 * (card - 1)))
+                state = max(0, min(card - 1, state))
+        else:
+            # assume it's already a discrete state index
+            state = int(value)
+            state = max(0, min(card - 1, state))
+
+        x = self._sample_assignment_do(int(node_idx), int(state))  # np int64 (d,)
+        return torch.tensor(x, dtype=torch.float32)  # torch float32 (d,)
