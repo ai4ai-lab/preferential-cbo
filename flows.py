@@ -90,7 +90,8 @@ def residual_flow(K, D, q0, device, precision_double, hidden_units=50, hidden_la
 
     # ActNorm warmup: sample to initialize ActNorm parameters
     nfm.eval()
-    _ = nfm.sample(num_samples=2 ** (D + 5))
+    warmup = min(8192, max(256, 32 * D))
+    _ = nfm.sample(num_samples=warmup)
     nfm.train()
 
     return nfm
