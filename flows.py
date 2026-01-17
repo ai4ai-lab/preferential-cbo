@@ -52,7 +52,8 @@ def real_nvp(K, D, q0, device, precision_double, hidden_multiplier=2):
 
     # ActNorm warmup: sample to initialize ActNorm parameters
     nfm.eval()
-    _ = nfm.sample(num_samples=2 ** (D + 5))
+    warmup = min(8192, 2 ** (D + 5))
+    _ = nfm.sample(num_samples=warmup)
     nfm.train()
 
     return nfm
